@@ -1,0 +1,13 @@
+构建环境：Windows 10/11 x64，Python 3.11 或 3.12 x64。
+在“工程”文件夹中执行：
+pip install pyinstaller==6.22.3 tkinterdnd2==0.6.4 ttkbootstrap==1.20.3 pillow
+python work/mp4_app/build_app.py --folder
+python -m PyInstaller --noconfirm --distpath outputs --workpath work/pyinstaller-build work/mp4_app/mp4_normalizer.spec
+
+目录版可从 outputs 内的版本文件夹直接运行，分发时保留整个文件夹。
+要构建单文件版，请去掉 --folder 重新生成 spec，再运行 PyInstaller。
+
+安装包使用上述目录版。安装官方 Inno Setup 6 后执行：
+ISCC work/mp4_app/installer.iss
+简体中文翻译来自 Inno Setup 官方源码仓库，已随源码附带。
+输出均在工程/outputs。程序运行时不需要 Python、Inno Setup 或额外安装 FFmpeg。

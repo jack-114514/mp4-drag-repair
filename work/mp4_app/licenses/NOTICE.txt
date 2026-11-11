@@ -1,0 +1,8 @@
+MP4一拖修复 1.2.5
+所有视频均在本机处理，程序不上传视频，不读取 Telegram 账户。
+视频转换使用独立运行的 FFmpeg/FFprobe 9.0.1 Essentials（Gyan.dev 构建），许可证 GPLv3。
+FFmpeg 许可证、构建信息随包附带。FFmpeg 源码：https://ffmpeg.org/download.html
+构建说明及外部依赖源码：https://www.gyan.dev/ffmpeg/builds/
+本程序 Python 源文件随包放在 source/mp4_normalizer.py，采用 MIT License。
+界面使用 ttkbootstrap 1.20.3（MIT）：https://github.com/israel-dryer/ttkbootstrap
+Python、Tcl/Tk 和 PyInstaller 采用其各自开源许可证。

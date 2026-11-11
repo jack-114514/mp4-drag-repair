@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+outputs/
+work/pyinstaller-build/
+work/app_tests/
+work/mp4_app/tools/
+work/mp4_app/mp4_normalizer.spec
+日志/
+*.log
