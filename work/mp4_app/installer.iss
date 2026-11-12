@@ -1,4 +1,4 @@
-#define AppVersion "1.2.5"
+#define AppVersion "1.2.7"
 #define SourceRoot AddBackslash(SourcePath)
 #define AppExe "MP4一拖修复_v" + AppVersion + ".exe"
 #define AppFolder "MP4一拖修复_v" + AppVersion

@@ -19,7 +19,7 @@ import uuid
 import math
 
 APP_NAME = 'MP4一拖修复'
-VERSION = '1.2.5'
+VERSION = '1.2.7'
 ROOT = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 LOG_DIR = (Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else ROOT)/'日志'
 NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
@@ -49,12 +49,13 @@ def unique_output(source, folder=None, original_name=False):
     max_stem = min(180, max(24, 235 - len(str(folder))))
     if len(stem) > max_stem:
         stem = stem[:max_stem-9] + '_' + hashlib.sha256(stem.encode()).hexdigest()[:8]
+    if not original_name:
+        stem += '_正常版'
+        target = folder/(stem + '.mp4')
+        if not os.path.lexists(target):
+            return target
     for i in range(1, 10000):
-        if original_name:
-            suffix = '_' + str(i)
-        else:
-            suffix = '_正常版' if i == 1 else '_正常版_' + str(i)
-        target = folder/(stem + suffix + '.mp4')
+        target = folder/(f'{stem}（{i}）.mp4')
         if not os.path.lexists(target):
             return target
     raise ConversionError('同名输出文件过多，请换一个文件夹。')
@@ -305,8 +306,9 @@ class Engine:
         self.on_estimate(estimate)
         return estimate
 
-    def validate_decode(self, path, duration, video, timing, checking_source=False):
-        full = self.full_check if checking_source else self.full_output_check()
+    def validate_decode(self, path, duration, video, timing, checking_source=False, force_full=False,
+                        preserve_timestamps=False):
+        full = force_full or (self.full_check if checking_source else self.full_output_check())
         stage = ('筛选源文件' if checking_source else '验证输出')+(' · 完整解码' if full else ' · 快速抽查')
         plan = timing.validation(video, duration, self._fps(video), full)
         self.eta_tail = 0
@@ -316,8 +318,9 @@ class Engine:
         base = ['-v', 'error', '-xerror']
         decoder = ['-protocol_whitelist', 'file,pipe,crypto', '-err_detect', 'explode']
         if full or duration <= 2:
+            timestamps = ['-fps_mode', 'passthrough', '-enc_time_base:v', video['time_base']] if preserve_timestamps else []
             args = base+decoder+['-threads', '4', '-i', path, '-map', '0:'+str(video['index']),
-                                 '-map', '0:a?', '-f', 'null', '-']
+                                 '-map', '0:a?']+timestamps+['-f', 'null', '-']
             code = self.run_ffmpeg(args, duration, stage, start, 98-start)
         else:
             positions = sorted(set(round(t, 6) for t in [0, duration*.25, duration*.5, duration*.75, duration-2]))
@@ -367,22 +370,30 @@ class Engine:
             return False
         return True
 
-    def publish(self, temp, target, source, before):
+    def publish(self, temp, source, before):
         self.check_cancel()
         after = source.stat()
         if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
                 after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
             raise ConversionError('处理期间源文件发生变化，请待下载完成后重试。')
-        if self.replace_source and target == source:
+        if self.replace_source and source.suffix.lower() == '.mp4':
             temp.replace(source)
-        else:
+            return source
+        while True:
+            self.check_cancel()
+            target = unique_output(source, temp.parent, self.original_name or self.replace_source)
             # Windows rename refuses an existing target.
-            temp.rename(target)
-            if self.replace_source:
-                try:
-                    source.unlink()
-                except OSError as exc:
-                    raise ConversionError('标准 MP4 已保存至 '+str(target)+'，原文件未能移除：'+str(exc)) from exc
+            try:
+                temp.rename(target)
+            except FileExistsError:
+                continue
+            break
+        if self.replace_source:
+            try:
+                source.unlink()
+            except OSError as exc:
+                raise ConversionError('标准 MP4 已保存至 '+str(target)+'，原文件未能移除：'+str(exc)) from exc
+        return target
 
     def convert(self, input_path):
         operation_started = time.monotonic()
@@ -405,10 +416,6 @@ class Engine:
         folder = source.parent if self.replace_source or not self.destination else self.destination.resolve()
         if not folder.is_dir():
             raise ConversionError('输出文件夹不存在，请重新选择。')
-        if self.replace_source:
-            target = source if source.suffix.lower() == '.mp4' else source.with_suffix('.mp4')
-        else:
-            target = unique_output(source, folder, self.original_name)
         token = uuid.uuid4().hex
         temp = folder/('.mp4fix-'+token+'.tmp')
         before = source.stat()
@@ -446,8 +453,6 @@ class Engine:
                     'log': str(self.log_path) if self.log_path else None,
                     'elapsed_seconds': round(time.monotonic()-operation_started, 3),
                     'phase_times': list(self.phase_times)}
-        if self.replace_source and target != source and os.path.lexists(target):
-            raise ConversionError('已有同名 MP4，无法替换源文件：'+str(target))
         self.output_directory = folder
         self.phase_times.clear()
         compatible = video.get('codec_name') == 'h264' and video.get('pix_fmt') in ('yuv420p', 'yuvj420p')
@@ -465,11 +470,12 @@ class Engine:
         maps = ['-map', '0:'+str(video['index'])]
         for audio in audios:
             maps += ['-map', '0:'+str(audio['index'])]
+        is_mpegts = info.get('format', {}).get('format_name') == 'mpegts'
         audio_options = []
         for i, audio in enumerate(audios):
             if audio.get('codec_name') == 'aac':
                 audio_options += ['-c:a:'+str(i), 'copy']
-                if info.get('format', {}).get('format_name') == 'mpegts':
+                if is_mpegts:
                     audio_options += ['-bsf:a:'+str(i), 'aac_adtstoasc']
             else:
                 bitrate = '384k' if int(audio.get('channels', 2)) > 2 else '192k'
@@ -478,12 +484,15 @@ class Engine:
         hardware = hardware_info()
         if self.log_path:
             self.log('本机硬件：'+json.dumps(hardware, ensure_ascii=False))
-        verify_full = self.full_output_check()
+        input_args = ['-y', '-fflags', '+genpts', '-protocol_whitelist', 'file,pipe,crypto']
+        recovered_ts = False
+        repaired_timestamps = False
         fps = self._fps(video)
-        validation = timing.validation({**video, 'codec_name': 'h264'}, duration, fps, verify_full)
         transcode_audio = any(audio.get('codec_name') != 'aac' for audio in audios)
 
         def estimate_conversion():
+            full = self.full_output_check() or recovered_ts or repaired_timestamps
+            validation = timing.validation({**video, 'codec_name': 'h264'}, duration, fps, full)
             backend = self.encoder_choice['backend']
             phase = timing.conversion(video, duration, before.st_size, fps, backend == 'copy',
                                       backend, self.speed, transcode_audio)
@@ -495,6 +504,20 @@ class Engine:
                 self.log('预计耗时：'+json.dumps(prediction, ensure_ascii=False))
             return phase, prediction
 
+        def mux_attempt(args, title):
+            nonlocal recovered_ts
+            code = self.mux(['-xerror']+args, temp, duration, title, reservation)
+            if code and is_mpegts and 'corrupt input packet' in self.last_stderr.lower():
+                # A TS discontinuity can flag a packet whose payload still decodes.
+                # Keep the packets and require strict decoding of the complete MP4.
+                self.log('TS 数据包被标记异常；保留数据包重试，输出须通过全片解码。')
+                recovered_ts = True
+                estimate_conversion()
+                code = self.mux(['-max_error_rate', '0']+args, temp, duration,
+                                title+'（TS 容错）', reservation)
+                recovered_ts = code == 0
+            return code
+
         conversion_plan, initial_estimate = estimate_conversion()
         method = ''
         success = False
@@ -503,8 +526,8 @@ class Engine:
             with temp.open('xb'):
                 pass
             if copy_video:
-                args = ['-y', '-xerror', '-fflags', '+genpts', '-protocol_whitelist', 'file,pipe,crypto', '-i', source]+maps+['-c:v', 'copy', '-tag:v', 'avc1']+audio_options
-                code = self.mux(args, temp, duration, '无损封装为标准 MP4', reservation)
+                args = input_args+['-i', source]+maps+['-c:v', 'copy', '-tag:v', 'avc1']+audio_options
+                code = mux_attempt(args, '无损封装为标准 MP4')
                 if code == 0:
                     method = '无损封装' if all(a.get('codec_name') == 'aac' for a in audios) else '视频无损封装，音频转换为 AAC'
                 elif self.mode == 'remux':
@@ -542,18 +565,37 @@ class Engine:
                     if backend != self.encoder_choice['backend']:
                         self.encoder_choice = {'backend': backend, 'encoder': encoder[1], 'name': title}
                         conversion_plan, _ = estimate_conversion()
-                    filters = [] if width % 2 == 0 and height % 2 == 0 else ['-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2']
+                    filters = [] if width % 2 == 0 and height % 2 == 0 else ['pad=ceil(iw/2)*2:ceil(ih/2)*2']
                     # Bounded GOP improves normal seeking and avoids decoding a
                     # long pre-roll for each quick-validation checkpoint.
                     gop = max(1, round(self._fps(video)*2))
-                    args = ['-y', '-xerror', '-fflags', '+genpts', '-protocol_whitelist', 'file,pipe,crypto']+input_options+['-i', source]+maps+encoder+filters+['-g', str(gop), '-fps_mode', 'passthrough', '-tag:v', 'avc1']+audio_options
-                    if self.mux(args, temp, duration, title, reservation) == 0:
+                    encode_args = input_args+input_options+['-i', source]+maps+encoder
+                    output_args = ['-g', str(gop), '-fps_mode', 'passthrough', '-tag:v', 'avc1']+audio_options
+                    args = encode_args+(['-vf', ','.join(filters)] if filters else [])+output_args
+                    code = mux_attempt(args, title)
+                    error = self.last_stderr.lower()
+                    if code and ('non-monotonic dts' in error or 'non-strictly-monotonic pts' in error):
+                        # Preserve all decoded frames and adjust only timestamps that
+                        # would collide, using one tick on the 90 kHz video clock.
+                        self.log('发现重复或倒退的时间戳，修正视频时间戳后重试。')
+                        repaired_timestamps = True
+                        estimate_conversion()
+                        timestamp_filters = filters+['settb=1/90000', "setpts='if(isnan(PREV_OUTPTS),PTS,max(PTS,PREV_OUTPTS+1))'"]
+                        args = encode_args+['-vf', ','.join(timestamp_filters), '-enc_time_base:v', '1:90000',
+                                            '-video_track_timescale', '90000']+output_args
+                        code = mux_attempt(args, title+'（时间戳修复）')
+                        repaired_timestamps = code == 0
+                    if code == 0:
                         method = title+'；原帧率、尺寸保留' if not filters else title+'；奇数尺寸边缘补 1 像素'
                         encoded = True
                         break
                 if not encoded:
                     raise ConversionError('转换失败，请检查磁盘空间或源文件，详情见处理日志。原文件未修改。')
             conversion_seconds = self.phase_times[-1]['seconds']
+            if recovered_ts:
+                method += '；TS 容错'
+            if repaired_timestamps:
+                method += '；时间戳修复'
             self.check_cancel()
             self.on_progress('检查 MP4 结构', 66)
             boxes = mp4_boxes(temp)
@@ -581,12 +623,12 @@ class Engine:
                 original_frames = output_frames = 0
             if original_frames > 0 and output_frames > 0 and original_frames != output_frames:
                 raise ConversionError('修复前后视频帧数不一致，未发布不完整的输出。')
-            validation_mode = self.validate_decode(temp, actual, ov[0], timing)
+            validation_mode = self.validate_decode(temp, actual, ov[0], timing,
+                                                   force_full=recovered_ts or repaired_timestamps,
+                                                   preserve_timestamps=repaired_timestamps)
             self.check_cancel()
             output_size = temp.stat().st_size
-            if not self.replace_source and os.path.lexists(target):
-                target = unique_output(source, folder, self.original_name)
-            self.publish(temp, target, source, before)
+            target = self.publish(temp, source, before)
             success = True
             result = {'ok': True, 'source': str(source), 'output': str(target),
                       'bytes': output_size, 'method': method,

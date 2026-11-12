@@ -260,7 +260,7 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
         '会记住这台电脑成功任务的平均速度，逐步校准估计；不会保存视频内容或文件名。'
         '首次估计较粗，文件损坏、长关键帧间隔和磁盘忙碌均可能增加时间。\n\n'
         '批量智能筛选\n可一次拖入多个文件。跳过通过兼容性和解码检查的 MP4，'
-        '其余文件尝试修复为 H.264/AAC MP4。默认快速抽查、同名替换，每批保存一份日志。\n\n'
+        '其余文件尝试修复为 H.264/AAC MP4。默认快速抽查、替换源文件。同名时自动编号，每批保存一份日志。\n\n'
         '输出与日志\n普通模式默认生成“_正常版.mp4”。替换前默认完整解码。'
         '勾选“快速替换验证”且检查方式为快速检查时，只解码关键位置，适合想缩短大文件处理时间时使用。'
         '双击已完成任务播放；选择任务可查看日志或视频信息。\n\n'
@@ -303,10 +303,10 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
     smart_toggle = ttk.Checkbutton(options_grid, text='批量智能筛选', variable=smart_scan,
                                    command=smart_defaults, bootstyle='round-toggle')
     smart_toggle.grid(row=0, column=0, sticky='w', pady=3)
-    option_tips.append(OptionTip(smart_toggle, '批量检查文件，跳过通过检查的 MP4，只修复需要处理的文件。开启时默认同名替换。'))
+    option_tips.append(OptionTip(smart_toggle, '批量检查文件，跳过通过检查的 MP4，只修复需要处理的文件。开启时默认替换源文件，同名时自动编号。'))
     for index, (label, var, tip_text) in enumerate([
         ('使用 GPU 加速', use_gpu, '需要转码时优先使用可用的 GPU 编码器，失败时自动改用 CPU。无损封装用不到 GPU。'),
-        ('替换原文件', replace_source, '修复结果通过检查后，替换原目录中的源文件。遇到同名冲突或检查失败时保留源文件。'),
+        ('替换原文件', replace_source, '修复结果通过检查后，替换原目录中的源文件。已有同名 MP4 时自动加（1）、（2）等编号。检查失败时保留源文件。'),
         ('快速替换验证', fast_replace, '选择快速检查时，替换前只解码抽查关键位置，可缩短处理时间。选择完整检查时仍逐帧验证。'),
         ('使用原文件名', original_name, '另存时沿用原文件主名，扩展名为 .mp4。遇到同名文件会自动编号。'),
         ('拖入即开始', autostart, '拖入或添加文件后立即按当前设置处理。关闭后可先整理队列，再点击“开始任务”。'),

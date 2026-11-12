@@ -1,5 +1,4 @@
 """Regression checks for mixed batches and source replacement."""
-import shutil
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -46,18 +45,28 @@ def main():
             mp4_boxes(output)
 
         corrupt = folder/'无法读取.mp4'
-        corrupt.write_bytes(b'invalid MP4')
-        collision = folder/'正常.ssv'
-        shutil.copyfile(normal, collision)
-        for source in (corrupt, collision):
-            before = source.read_bytes()
-            try:
-                engine.convert(source)
-            except ConversionError:
-                pass
-            else:
-                raise AssertionError(f'Expected failure for {source.name}')
-            assert source.read_bytes() == before
+        corrupt_data = b'invalid MP4'
+        corrupt.write_bytes(corrupt_data)
+        try:
+            engine.convert(corrupt)
+        except ConversionError:
+            pass
+        else:
+            raise AssertionError(f'Expected failure for {corrupt.name}')
+        assert corrupt.read_bytes() == corrupt_data
+
+        existing = sample('重名.mp4', [])
+        existing_bytes = existing.read_bytes()
+        numbered = {}
+        for number in (1, 2):
+            source = sample('重名.css', ['-f', 'mpegts'])
+            result = engine.convert(source)
+            output = folder/f'重名（{number}）.mp4'
+            assert Path(result['output']) == output and not source.exists()
+            mp4_boxes(output)
+            numbered[output] = output.read_bytes()
+        assert existing.read_bytes() == existing_bytes
+        assert all(path.read_bytes() == data for path, data in numbered.items())
         assert normal.read_bytes() == original
         assert list(folder.glob('*.log')) == [engine.batch_log]
         assert not list(folder.glob('*.处理日志.txt'))
@@ -77,8 +86,32 @@ def main():
         engine.write_logs = False
         engine.mode = 'encode'
         result = engine.convert(normal)
-        assert Path(result['output']).name == '正常_1.mp4'
+        assert Path(result['output']).name == '正常（1）.mp4'
         assert result['selected_encoder']['backend'] == 'cpu' and result['log'] is None
+
+        # Segment boundaries reset the MPEG-TS continuity counters while keeping
+        # a continuous timeline. The flagged packets still contain valid frames.
+        sample('分段-%d.ts', ['-t', '6', '-g', '24', '-f', 'segment', '-segment_time', '2',
+                               '-segment_format', 'mpegts'])
+        ts = folder/'分段下载.css'
+        ts_data = b''.join((folder/f'分段-{i}.ts').read_bytes() for i in range(3))
+        ts.write_bytes(ts_data)
+        engine.mode = 'auto'
+        engine.full_check = False
+        result = engine.convert(ts)
+        assert 'TS 容错' in result['method'] and not result['reencoded_video']
+        assert result['validation_mode'] == 'full' and ts.read_bytes() == ts_data
+        assert engine.probe(result['output'])['streams'][0]['nb_frames'] == '144'
+
+        # Two frames 1 ms apart collide at the default 24 fps encoder time base.
+        mov = sample('相邻时间戳.mov', ['-t', '4', '-c:v', 'libx265', '-preset', 'ultrafast',
+                                         '-x265-params', 'log-level=error:bframes=0',
+                                         '-vf', "settb=1/1000,setpts='if(eq(N,25),PREV_OUTPTS+1,PTS)'",
+                                         '-fps_mode', 'passthrough', '-enc_time_base:v', '1:1000',
+                                         '-video_track_timescale', '1000', '-tag:v', 'hvc1'])
+        result = engine.convert(mov)
+        assert '时间戳修复' in result['method'] and result['validation_mode'] == 'full'
+        assert engine.probe(result['output'])['streams'][0]['nb_frames'] == '96'
         print('SMART BATCH CHECKS PASSED')
 
 

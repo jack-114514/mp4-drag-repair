@@ -1,4 +1,4 @@
-MP4一拖修复 1.2.5
+MP4一拖修复 1.2.7
 所有视频均在本机处理，程序不上传视频，不读取 Telegram 账户。
 视频转换使用独立运行的 FFmpeg/FFprobe 9.0.1 Essentials（Gyan.dev 构建），许可证 GPLv3。
 FFmpeg 许可证、构建信息随包附带。FFmpeg 源码：https://ffmpeg.org/download.html
