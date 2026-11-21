@@ -17,9 +17,11 @@ import threading
 import time
 import uuid
 import math
+from resource_limits import ProcessLimits, ResourceLimits
 
 APP_NAME = 'MP4一拖修复'
-VERSION = '1.2.7'
+VERSION = '1.2.10'
+RESOLUTIONS = {'480p': 480, '720p': 720, '1080p': 1080, '2K': 1440, '4K': 2160}
 ROOT = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 LOG_DIR = (Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else ROOT)/'日志'
 NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
@@ -28,7 +30,27 @@ class Cancelled(Exception):
     pass
 
 class ConversionError(Exception):
-    pass
+    def __init__(self, message, suggestion=None, retry=None):
+        super().__init__(message)
+        self.suggestion = suggestion
+        self.retry = retry
+
+
+def video_dimensions(video):
+    width, height = int(video.get('width', 0)), int(video.get('height', 0))
+    return (height, width) if video_rotation(video) % 180 == 90 else (width, height)
+
+
+def video_rotation(video):
+    for side_data in video.get('side_data_list', []):
+        if 'rotation' in side_data:
+            return round(float(side_data['rotation']))
+    return 0
+
+
+def main_video(info):
+    return next((s for s in info.get('streams', []) if s.get('codec_type') == 'video'
+                 and not s.get('disposition', {}).get('attached_pic')), None)
 
 def create_processing_log(prefix, header):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -91,7 +113,8 @@ def mp4_boxes(path, require_faststart=True):
     return boxes
 
 class Engine:
-    def __init__(self, on_progress=None, full_check=False, mode='auto', speed='balanced', destination=None):
+    def __init__(self, on_progress=None, full_check=False, mode='auto', speed='balanced', destination=None,
+                 resolution=None, resource_limits=ResourceLimits()):
         self.ffmpeg = ROOT/'tools'/'ffmpeg.exe'
         self.ffprobe = ROOT/'tools'/'ffprobe.exe'
         self.on_progress = on_progress or (lambda stage, value: None)
@@ -105,6 +128,8 @@ class Engine:
         self.phase_times = []
         self.mode = mode
         self.speed = speed
+        self.resolution = resolution
+        self.resource_limits = resource_limits
         self.destination = Path(destination) if destination else None
         self.smart_scan = False
         self.replace_source = False
@@ -149,7 +174,10 @@ class Engine:
                              stderr=subprocess.PIPE, creationflags=NO_WINDOW)
         self.process = p
         start = time.monotonic()
+        limits = None
         try:
+            if self.resource_limits.cpu or self.resource_limits.memory:
+                limits = ProcessLimits(p, self.resource_limits)
             while True:
                 try:
                     out, err = p.communicate(timeout=.25)
@@ -159,11 +187,15 @@ class Engine:
                     if time.monotonic()-start > timeout:
                         raise ConversionError('分析超时，文件可能损坏或无法读取。')
             self.log(err.decode('utf-8', 'replace'))
+            if limits:
+                limits.check_result(p.returncode, err.decode('utf-8', 'replace'))
             return p.returncode, out, err
         finally:
             if p.poll() is None:
                 p.kill()
                 p.communicate()
+            if limits:
+                limits.close()
             self.process = None
 
     def probe(self, path, deep=False):
@@ -198,6 +230,9 @@ class Engine:
         self.process = p
         self.last_stderr = ''
         error_tail = []
+        uses_gpu = any(a in ('h264_nvenc', 'h264_amf', 'h264_qsv') for a in args)
+        limits = None
+        error_reader = None
         def collect_errors():
             batch = []
             for error_line in p.stderr:
@@ -210,9 +245,11 @@ class Engine:
                     batch.clear()
             if batch:
                 self.log('\n'.join(batch))
-        error_reader = threading.Thread(target=collect_errors, daemon=True)
-        error_reader.start()
         try:
+            if any(self.resource_limits):
+                limits = ProcessLimits(p, self.resource_limits, uses_gpu)
+            error_reader = threading.Thread(target=collect_errors, daemon=True)
+            error_reader.start()
             for line in p.stdout:
                 self.check_cancel()
                 key, _, val = line.strip().partition('=')
@@ -247,8 +284,11 @@ class Engine:
             if p.poll() is None:
                 p.kill()
                 p.wait()
+            if limits:
+                limits.close()
             p.stdout.close()
-            error_reader.join(timeout=5)
+            if error_reader:
+                error_reader.join(timeout=5)
             p.stderr.close()
             self.process = None
         self.last_stderr = ''.join(error_tail)
@@ -256,6 +296,10 @@ class Engine:
         phase_seconds = round(time.monotonic()-started, 3)
         self.phase_times.append({'stage': stage, 'seconds': phase_seconds, 'exit_code': code})
         self.log('阶段耗时：'+str(phase_seconds)+' 秒')
+        if limits:
+            if limits.memory_bytes:
+                self.log(f'处理进程内存上限：{limits.memory_bytes // 1024**2} MB（提交量）')
+            limits.check_result(code, self.last_stderr)
         if code == 0:
             self.on_progress(stage+'完成', start+span)
         return code
@@ -333,11 +377,12 @@ class Engine:
             code = self.run_ffmpeg(base+inputs+outputs, 0, stage, start, 98-start)
         if code != 0:
             raise ConversionError('全片解码检查失败。' if full else '关键位置解码检查失败。')
-        timing.record(plan, self.phase_times[-1]['seconds'])
+        if not self.resource_limits.cpu and not self.resource_limits.memory:
+            timing.record(plan, self.phase_times[-1]['seconds'])
         return 'full' if full else 'quick'
 
     def full_output_check(self):
-        return self.full_check or (self.replace_source and not self.fast_replace)
+        return self.full_check or (self.resolution is None and self.replace_source and not self.fast_replace)
 
     def can_nvenc(self):
         return self.choose_encoder()['backend'] == 'nvenc'
@@ -376,19 +421,20 @@ class Engine:
         if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
                 after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
             raise ConversionError('处理期间源文件发生变化，请待下载完成后重试。')
-        if self.replace_source and source.suffix.lower() == '.mp4':
+        replace_source = self.replace_source and self.resolution is None
+        if replace_source and source.suffix.lower() == '.mp4':
             temp.replace(source)
             return source
         while True:
             self.check_cancel()
-            target = unique_output(source, temp.parent, self.original_name or self.replace_source)
+            target = unique_output(source, temp.parent, self.original_name or replace_source)
             # Windows rename refuses an existing target.
             try:
                 temp.rename(target)
             except FileExistsError:
                 continue
             break
-        if self.replace_source:
+        if replace_source:
             try:
                 source.unlink()
             except OSError as exc:
@@ -408,20 +454,23 @@ class Engine:
         if self.write_logs and self.log_path is None:
             self.log_path = create_processing_log('处理', APP_NAME+' '+VERSION)
         if not source.is_file():
-            raise ConversionError('文件不存在或不是普通文件。')
+            raise ConversionError('找不到源视频。', '确认文件仍在原位置，或重新添加已移动的文件。')
         if not self.ffmpeg.is_file() or not self.ffprobe.is_file():
             raise ConversionError('程序组件不完整，请重新下载 EXE。')
         if self.mode not in ('auto', 'remux', 'encode') or self.speed not in ('quality', 'balanced', 'fast'):
             raise ConversionError('处理设置无效。')
-        folder = source.parent if self.replace_source or not self.destination else self.destination.resolve()
+        replace_source = self.replace_source and self.resolution is None
+        folder = source.parent if replace_source or not self.destination else self.destination.resolve()
         if not folder.is_dir():
-            raise ConversionError('输出文件夹不存在，请重新选择。')
+            raise ConversionError('输出文件夹不存在。', '选择一个可写的目录，另存修复结果。', 'destination')
         token = uuid.uuid4().hex
         temp = folder/('.mp4fix-'+token+'.tmp')
         before = source.stat()
         self.log(APP_NAME+' '+VERSION+'\n'+datetime.datetime.now().isoformat())
         self.log('FFmpeg 9.0.1 (GPLv3)：https://ffmpeg.org/ ；构建与源码说明：https://www.gyan.dev/ffmpeg/builds/ ；许可证随 EXE 内置。')
         self.log('原文件：'+str(source))
+        if any(self.resource_limits):
+            self.log('资源限制：'+self.resource_limits.describe())
         self.on_progress('正在分析视频', 2)
         try:
             info = self.probe(source)
@@ -430,12 +479,10 @@ class Engine:
         if not info.get('streams') or not info.get('format', {}).get('duration'):
             info = self.probe(source, deep=True)
         streams = info.get('streams', [])
-        videos = [s for s in streams if s.get('codec_type') == 'video'
-                  and not s.get('disposition', {}).get('attached_pic')]
         audios = [s for s in streams if s.get('codec_type') == 'audio']
-        if not videos:
+        video = main_video(info)
+        if not video:
             raise ConversionError('文件没有可用的视频轨道。')
-        video = videos[0]
         width, height = int(video.get('width', 0)), int(video.get('height', 0))
         if width <= 0 or height <= 0:
             raise ConversionError('视频分辨率无效，无法可靠修复。')
@@ -445,9 +492,18 @@ class Engine:
             duration = 0.0
         if not math.isfinite(duration) or duration <= 0:
             raise ConversionError('无法确定视频时长，文件可能不完整。')
+        resized = self.resolution is not None
+        expected = None
+        if resized:
+            display_width, display_height = video_dimensions(video)
+            short_edge = min(display_width, display_height)
+            if self.resolution not in RESOLUTIONS.values() or self.resolution >= short_edge:
+                raise ConversionError('所选分辨率必须低于源视频。', '重新打开“降分辨率”，选择更低的档位。')
+            expected = tuple(max(2, (edge*self.resolution//short_edge)//2*2)
+                             for edge in (display_width, display_height))
         from hardware_info import hardware_info, TimingHistory
         timing = TimingHistory()
-        if self.smart_scan and self.standard_input(source, info, video, audios, duration, timing):
+        if self.smart_scan and not resized and self.standard_input(source, info, video, audios, duration, timing):
             self.log('已跳过：原文件通过 MP4 兼容性及解码检查。')
             return {'ok': True, 'skipped': True, 'source': str(source), 'output': str(source),
                     'log': str(self.log_path) if self.log_path else None,
@@ -456,17 +512,18 @@ class Engine:
         self.output_directory = folder
         self.phase_times.clear()
         compatible = video.get('codec_name') == 'h264' and video.get('pix_fmt') in ('yuv420p', 'yuvj420p')
-        if self.mode == 'remux' and not compatible:
-            raise ConversionError('此视频需要转换为 H.264 才能改善兼容性，请使用“自动修复”。纯封装模式不会重新编码。')
-        copy_video = compatible and self.mode != 'encode'
+        if self.mode == 'remux' and not compatible and not resized:
+            raise ConversionError('源视频无法直接封装成兼容的 H.264 MP4。',
+                                  '切换到“自动修复”，允许重新编码。', 'auto')
+        copy_video = compatible and self.mode != 'encode' and not resized
         reservation = self.index_reservation(video, audios, duration)
         self.log('处理模式：'+self.mode+'；速度：'+self.speed+'；索引预留：'+str(reservation)+' 字节（避免完成后搬移整片）')
         free = shutil.disk_usage(self.output_directory).free
         required = max(128*1024**2, before.st_size + 64*1024**2)
-        if not copy_video:
+        if not copy_video and not resized:
             required = max(required, int(width*height*max(24, self._fps(video))*duration*.08/8))
         if free < required:
-            raise ConversionError('输出磁盘剩余空间不足，请先腾出空间。')
+            raise ConversionError('输出磁盘剩余空间不足。', '选择剩余空间充足的目录，另存处理结果。', 'destination')
         maps = ['-map', '0:'+str(video['index'])]
         for audio in audios:
             maps += ['-map', '0:'+str(audio['index'])]
@@ -480,6 +537,17 @@ class Engine:
             else:
                 bitrate = '384k' if int(audio.get('channels', 2)) > 2 else '192k'
                 audio_options += ['-c:a:'+str(i), 'aac', '-b:a:'+str(i), bitrate]
+        rate_limit = []
+        if resized:
+            self.log(f'降分辨率：{display_width}×{display_height} → {expected[0]}×{expected[1]}')
+            audio_rate = 0
+            for audio in audios:
+                estimate = 384000 if int(audio.get('channels', 2)) > 2 else 192000
+                bitrate = str(audio.get('bit_rate', ''))
+                audio_rate += int(bitrate) if audio.get('codec_name') == 'aac' and bitrate.isdecimal() else estimate
+            budget = int(before.st_size*8/duration*.9) - audio_rate
+            rate = max(64000, budget)
+            rate_limit = ['-maxrate:v', str(rate), '-bufsize:v', str(rate)]
         self.encoder_choice = {'backend': 'copy', 'encoder': 'copy', 'name': '无损封装（无需 GPU 编码）'} if copy_video else self.choose_encoder()
         hardware = hardware_info()
         if self.log_path:
@@ -489,13 +557,20 @@ class Engine:
         repaired_timestamps = False
         fps = self._fps(video)
         transcode_audio = any(audio.get('codec_name') != 'aac' for audio in audios)
+        resize_pipeline = None
 
         def estimate_conversion():
             full = self.full_output_check() or recovered_ts or repaired_timestamps
-            validation = timing.validation({**video, 'codec_name': 'h264'}, duration, fps, full)
+            output_video = {**video, 'codec_name': 'h264'}
+            if expected:
+                output_video.update(width=expected[0], height=expected[1])
+            validation = timing.validation(output_video, duration, fps, full)
             backend = self.encoder_choice['backend']
             phase = timing.conversion(video, duration, before.st_size, fps, backend == 'copy',
-                                      backend, self.speed, transcode_audio)
+                                      backend, self.speed, transcode_audio,
+                                      resize_pipeline=resize_pipeline, resize_target=self.resolution)
+            if backend in ('nvenc', 'qsv', 'amf') and 0 < self.resource_limits.gpu < 100:
+                phase['seconds'] *= 100 / self.resource_limits.gpu
             self.eta_tail = validation['seconds']
             prediction = self.announce_estimate(phase['seconds']+self.eta_tail,
                                                 phase['learned'] and validation['learned'],
@@ -531,7 +606,7 @@ class Engine:
                 if code == 0:
                     method = '无损封装' if all(a.get('codec_name') == 'aac' for a in audios) else '视频无损封装，音频转换为 AAC'
                 elif self.mode == 'remux':
-                    raise ConversionError('无损封装失败，详情见日志；未自动转码，原文件保留。')
+                    raise ConversionError('无损封装失败。', '切换到“自动修复”，允许重新编码。', 'auto')
             if not method:
                 encoded = False
                 options = []
@@ -541,14 +616,21 @@ class Engine:
                 if self.encoder_choice['backend'] == 'nvenc':
                     preset = {'quality': 'p6', 'balanced': 'p4', 'fast': 'p2'}[self.speed]
                     lookahead = {'quality': '32', 'balanced': '16', 'fast': '0'}[self.speed]
+                    quick_resize = resized and self.speed == 'fast'
                     nvenc = ['-c:v', 'h264_nvenc', '-preset', preset, '-tune', 'hq',
                              '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-spatial-aq', '1',
-                             '-temporal-aq', '1', '-rc-lookahead', lookahead, '-bf', '3',
+                             '-temporal-aq', '0' if quick_resize else '1', '-rc-lookahead', lookahead,
+                             '-bf', '2' if quick_resize else '3',
                              '-profile:v', 'high']
-                    if width % 2 == 0 and height % 2 == 0 and video.get('codec_name') in ('h264', 'hevc'):
-                        options.append((['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'], nvenc, 'H.264 高质量硬件转换', 'nvenc'))
+                    cuda_compatible = (width % 2 == 0 and height % 2 == 0
+                                       and video.get('codec_name') in ('h264', 'hevc')
+                                       and (not resized or video_rotation(video) % 360 == 0))
+                    if cuda_compatible:
+                        title = 'GPU 解码、缩放和编码（NVIDIA）' if resized else 'H.264 高质量硬件转换'
+                        options.append((['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'], nvenc, title, 'nvenc'))
                     # CUDA decode may be unsupported even when NVENC is available.
-                    options.append(([], nvenc+['-pix_fmt', 'yuv420p'], 'H.264 高质量硬件转换', 'nvenc'))
+                    title = 'CPU 缩放、GPU 编码（NVIDIA）' if resized else 'H.264 高质量硬件转换'
+                    options.append(([], nvenc+['-pix_fmt', 'yuv420p'], title, 'nvenc'))
                 elif self.encoder_choice['backend'] == 'qsv':
                     preset = {'quality': 'slow', 'balanced': 'medium', 'fast': 'veryfast'}[self.speed]
                     options.append(([], ['-c:v', 'h264_qsv', '-preset', preset, '-global_quality', '18',
@@ -562,14 +644,24 @@ class Engine:
                                      '-pix_fmt', 'yuv420p'], 'H.264 高质量转换', 'cpu'))
                 for input_options, encoder, title, backend in options:
                     self.check_cancel()
-                    if backend != self.encoder_choice['backend']:
-                        self.encoder_choice = {'backend': backend, 'encoder': encoder[1], 'name': title}
-                        conversion_plan, _ = estimate_conversion()
+                    if resized or backend != self.encoder_choice['backend']:
+                        self.encoder_choice = {**self.encoder_choice, 'backend': backend, 'encoder': encoder[1], 'name': title}
+                        if resized:
+                            resize_pipeline = 'cuda' if input_options else 'software'
+                        conversion_plan, initial_estimate = estimate_conversion()
                     filters = [] if width % 2 == 0 and height % 2 == 0 else ['pad=ceil(iw/2)*2:ceil(ih/2)*2']
+                    if resized:
+                        target_width, target_height = expected
+                        if resize_pipeline == 'cuda':
+                            algo = {'fast': 'bilinear', 'balanced': 'bicubic', 'quality': 'lanczos'}[self.speed]
+                            filters = [f'scale_cuda={target_width}:{target_height}:interp_algo={algo}:format=nv12']
+                        else:
+                            algo = 'fast_bilinear' if self.speed == 'fast' else 'lanczos'
+                            filters = [f'scale={target_width}:{target_height}:flags={algo}']
                     # Bounded GOP improves normal seeking and avoids decoding a
                     # long pre-roll for each quick-validation checkpoint.
                     gop = max(1, round(self._fps(video)*2))
-                    encode_args = input_args+input_options+['-i', source]+maps+encoder
+                    encode_args = input_args+input_options+['-i', source]+maps+encoder+rate_limit
                     output_args = ['-g', str(gop), '-fps_mode', 'passthrough', '-tag:v', 'avc1']+audio_options
                     args = encode_args+(['-vf', ','.join(filters)] if filters else [])+output_args
                     code = mux_attempt(args, title)
@@ -586,11 +678,20 @@ class Engine:
                         code = mux_attempt(args, title+'（时间戳修复）')
                         repaired_timestamps = code == 0
                     if code == 0:
-                        method = title+'；原帧率、尺寸保留' if not filters else title+'；奇数尺寸边缘补 1 像素'
+                        if resized:
+                            method = f'{title}；降至 {expected[0]}×{expected[1]}'
+                        else:
+                            method = title+'；原帧率、尺寸保留' if not filters else title+'；奇数尺寸边缘补 1 像素'
                         encoded = True
                         break
                 if not encoded:
-                    raise ConversionError('转换失败，请检查磁盘空间或源文件，详情见处理日志。原文件未修改。')
+                    if 'no space left' in error:
+                        raise ConversionError('转换时输出磁盘空间耗尽。', '换到空间更充足的目录后重试。', 'destination')
+                    if any(term in error for term in ('corrupt input packet', 'invalid data', 'error while decoding')):
+                        raise ConversionError('转码时读到无法处理的视频数据。', '请重新下载源视频，再用“自动修复”处理。')
+                    if self.mode == 'encode' and compatible and not resized:
+                        raise ConversionError('强制转码失败。', '切换到“仅无损封装”，直接使用原视频轨道。', 'remux')
+                    raise ConversionError('转换失败，详情见处理日志。')
             conversion_seconds = self.phase_times[-1]['seconds']
             if recovered_ts:
                 method += '；TS 容错'
@@ -608,7 +709,8 @@ class Engine:
             if len(oa) != len(audios) or any(a.get('codec_name') != 'aac' for a in oa):
                 raise ConversionError('输出音频轨道检查失败。')
             actual_reencoded = '无损封装' not in method
-            expected = (width+(width%2 if actual_reencoded else 0), height+(height%2 if actual_reencoded else 0))
+            if expected is None:
+                expected = (width+(width%2 if actual_reencoded else 0), height+(height%2 if actual_reencoded else 0))
             if (ov[0].get('width'), ov[0].get('height')) != expected:
                 raise ConversionError('输出尺寸与预期不一致。')
             actual = float(output.get('format', {}).get('duration', 0))
@@ -623,16 +725,25 @@ class Engine:
                 original_frames = output_frames = 0
             if original_frames > 0 and output_frames > 0 and original_frames != output_frames:
                 raise ConversionError('修复前后视频帧数不一致，未发布不完整的输出。')
-            validation_mode = self.validate_decode(temp, actual, ov[0], timing,
-                                                   force_full=recovered_ts or repaired_timestamps,
-                                                   preserve_timestamps=repaired_timestamps)
+            try:
+                validation_mode = self.validate_decode(temp, actual, ov[0], timing,
+                                                       force_full=recovered_ts or repaired_timestamps,
+                                                       preserve_timestamps=repaired_timestamps)
+            except ConversionError as exc:
+                if not actual_reencoded:
+                    raise ConversionError(str(exc), '切换到“强制转换 H.264”，重建视频轨道后再验证。', 'encode') from exc
+                raise
             self.check_cancel()
             output_size = temp.stat().st_size
+            if resized and output_size >= before.st_size:
+                raise ConversionError('降分辨率后的文件仍未小于原文件。',
+                                      '请在“降分辨率”中选择更低的档位。源视频码率很低时，可降低的体积有限。')
             target = self.publish(temp, source, before)
             success = True
             result = {'ok': True, 'source': str(source), 'output': str(target),
                       'bytes': output_size, 'method': method,
                       'reencoded_video': actual_reencoded,
+                      'resolution': self.resolution,
                       'duration': actual, 'log': str(self.log_path) if self.log_path else None, 'boxes': boxes,
                       'validation_mode': validation_mode,
                       'elapsed_seconds': round(time.monotonic()-operation_started, 3),
@@ -644,7 +755,8 @@ class Engine:
                       'large_for_free_telegram': output_size > 2147483648}
             if self.log_path:
                 self.log('成功：'+json.dumps(result, ensure_ascii=False))
-            timing.record(conversion_plan, conversion_seconds)
+            if not any(self.resource_limits):
+                timing.record(conversion_plan, conversion_seconds)
             self.on_progress('完成', 100)
             return result
         except Exception as exc:

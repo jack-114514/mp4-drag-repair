@@ -6,6 +6,7 @@ from pathlib import Path
 import platform
 import threading
 import time
+from resource_limits import ResourceLimitError
 
 _lock = threading.RLock()
 _encoders = {}
@@ -78,7 +79,7 @@ def select_encoder(ffmpeg, capture):
                     _encoders[key] = result
                     return dict(result)
             except Exception as exc:
-                if exc.__class__.__name__ == 'Cancelled':
+                if isinstance(exc, ResourceLimitError) or exc.__class__.__name__ == 'Cancelled':
                     raise
                 attempts.append({'encoder': encoder, 'ok': False, 'error': str(exc)})
         result = {'backend': 'cpu', 'encoder': 'libx264', 'name': 'CPU 软件编码', 'attempts': attempts}
@@ -120,11 +121,18 @@ class TimingHistory:
         return {'seconds': work/rate+overhead, 'learned': count > 0, 'overhead': overhead,
                 'rate_key': key, 'work_units': work}
 
-    def conversion(self, video, duration, size, fps, copying, backend, speed, transcode_audio):
+    def conversion(self, video, duration, size, fps, copying, backend, speed, transcode_audio,
+                   resize_pipeline=None, resize_target=None):
         if copying and transcode_audio:
             return self.phase('remux_aac', max(size/1024**2, duration*2), 85, .15)
         key = 'remux' if copying else backend+'_'+speed+'_'+video.get('codec_name', 'unknown')
         default = 85 if copying else 90 if backend == 'cpu' else 450
+        if resize_pipeline:
+            key += f'_resize_{resize_pipeline}_{resize_target}'
+            if resize_pipeline == 'cuda':
+                default = {'fast': 740, 'balanced': 560, 'quality': 420}[speed]
+            else:
+                default = min(default, 320)
         return self.phase(key, self.work(video, duration, size, fps, copying), default, .15)
 
     def validation(self, video, duration, fps, full):

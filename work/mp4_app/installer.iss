@@ -1,4 +1,4 @@
-#define AppVersion "1.2.7"
+#define AppVersion "1.2.10"
 #define SourceRoot AddBackslash(SourcePath)
 #define AppExe "MP4一拖修复_v" + AppVersion + ".exe"
 #define AppFolder "MP4一拖修复_v" + AppVersion
@@ -45,6 +45,7 @@ Source: "{#SourceRoot}licenses\*"; DestDir: "{app}\开源许可证"; Flags: igno
 Source: "{#SourceRoot}mp4_normalizer.py"; DestDir: "{app}\源码"; Flags: ignoreversion
 Source: "{#SourceRoot}app_ui.py"; DestDir: "{app}\源码"; Flags: ignoreversion
 Source: "{#SourceRoot}hardware_info.py"; DestDir: "{app}\源码"; Flags: ignoreversion
+Source: "{#SourceRoot}resource_limits.py"; DestDir: "{app}\源码"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\MP4一拖修复"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"

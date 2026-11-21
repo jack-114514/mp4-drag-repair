@@ -285,6 +285,11 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
     original_name = tk.BooleanVar(value=cfg.get('original_name', smart_scan.get()))
     use_gpu = tk.BooleanVar(value=cfg.get('use_gpu', True))
     auto_close = tk.BooleanVar(value=cfg.get('auto_close', False))
+    configured_limits = cfg.get('resource_limits', {})
+    if not isinstance(configured_limits, dict):
+        configured_limits = {}
+    limits = core.ResourceLimits(*(value if type(value) is int and 0 <= value <= 100 else 0
+                                   for value in (configured_limits.get(key) for key in ('cpu', 'memory', 'gpu'))))
     regular_settings = [False, False, next(iter(MODES))]
     def smart_defaults():
         if smart_scan.get():
@@ -338,7 +343,7 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
     update_dest()
     replace_source.trace_add('write', lambda *_: update_dest())
     def choose_destination():
-        folder = filedialog.askdirectory(title='选择正常版的保存位置')
+        folder = filedialog.askdirectory(title='选择正常版的保存位置', parent=root)
         if folder:
             destination_var.set(folder)
             update_dest()
@@ -347,6 +352,54 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
     ttk.Button(dest_buttons, text='选择目录', command=choose_destination, bootstyle='primary-outline').pack(side='left')
     ttk.Button(dest_buttons, text='恢复默认', command=lambda: (destination_var.set(''), update_dest()),
                bootstyle='info-outline').pack(side='left', padx=6)
+
+    def edit_resource_limits():
+        dialog = tk.Toplevel(root)
+        dialog.title('资源限制')
+        dialog.transient(root)
+        dialog.resizable(False, False)
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill='both', expand=True)
+        choices = ('不限', *(str(n) for n in range(1, 101)))
+        entries = []
+        for row, (label, value) in enumerate(zip(('CPU 上限（%）', '内存上限（%）', 'GPU 平均占用目标（%）'), limits)):
+            ttk.Label(body, text=label).grid(row=row, column=0, sticky='w', pady=4, padx=(0, 14))
+            entry = ttk.Spinbox(body, values=choices, width=8)
+            entry.set(str(value) if value else '不限')
+            entry.grid(row=row, column=1, sticky='e', pady=4)
+            entries.append(entry)
+        ttk.Label(body, text='CPU 和内存限制视频处理进程。内存百分比按电脑总内存换算。'
+                             '\nGPU 通过间歇限速降低平均占用，瞬时读数可能更高。'
+                             '\n设置用于新提交或重试的任务。',
+                  justify='left', wraplength=430).grid(row=3, columnspan=2, sticky='w', pady=(10, 12))
+        buttons = ttk.Frame(body)
+        buttons.grid(row=4, columnspan=2, sticky='ew')
+
+        def apply():
+            nonlocal limits
+            values = [entry.get().strip().removesuffix('%').strip() for entry in entries]
+            try:
+                selected = [0 if value == '不限' else int(value) for value in values]
+                if any(not 0 <= value <= 100 for value in selected):
+                    raise ValueError()
+            except ValueError:
+                messagebox.showerror('资源限制', '请输入 1–100 之间的整数，或选“不限”。', parent=dialog)
+                return
+            limits = core.ResourceLimits(*selected)
+            limit_label.configure(text=limits.describe() or '资源不限')
+            save_config()
+            dialog.destroy()
+
+        ttk.Button(buttons, text='保存', command=apply, bootstyle='primary').pack(side='right')
+        ttk.Button(buttons, text='取消', command=dialog.destroy).pack(side='right', padx=8)
+        dialog.bind('<Escape>', lambda event: dialog.destroy())
+        dialog.grab_set()
+        entries[0].focus_set()
+
+    ttk.Button(dest_buttons, text='资源限制', command=edit_resource_limits,
+               bootstyle='info-outline').pack(side='left')
+    limit_label = ttk.Label(right, text=limits.describe() or '资源不限', bootstyle='info', wraplength=318)
+    limit_label.pack(anchor='w')
     bind_settings_wheel(right_panel)
     actions = ttk.Frame(left)
     actions.grid(row=1, column=0, sticky='ew', pady=(12, 0))
@@ -392,6 +445,8 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
         batch_estimate_var.trace_add('write', lambda *_: batch_estimates.append(batch_estimate_var.get()))
     inspection_running = threading.Event()
     inspector = core.Engine()
+    failures = {}
+    failure_window = None
     def log_ui(text):
         log_text.configure(state='normal')
         log_text.insert('end', datetime.datetime.now().strftime('%H:%M:%S')+'  '+text+'\n')
@@ -426,7 +481,7 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
         tree.item(iid, values=(Path(row['source']).name, size_text(row['size']), row['status'], row['time'], row.get('eta', '分析后显示')))
     active_run = {}
     batch_rates = {}
-    def submit(only=None):
+    def submit(only=None, overrides=None):
         waiting = [(iid, row) for iid, row in rows.items()
                    if (row['status'] == '等待开始' if only is None else iid in only)]
         if not waiting:
@@ -437,28 +492,30 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
                    'smart_scan': smart_scan.get(), 'replace_source': replace_source.get(),
                    'fast_replace': fast_replace.get(),
                    'original_name': original_name.get(),
-                   'use_gpu': use_gpu.get(), 'batch_log': None}
-        if options['destination'] and not Path(options['destination']).is_dir():
-            messagebox.showerror(core.APP_NAME, '输出目录不存在，请重新选择。')
-            return
+                   'use_gpu': use_gpu.get(), 'batch_log': None, 'resolution': None}
+        options.update(overrides or {})
+        options['resource_limits'] = limits
         if options['smart_scan']:
             try:
                 batch_log = core.create_processing_log('批量修复', f'批量智能筛选 · {len(waiting)} 个文件')
             except OSError as exc:
                 messagebox.showerror(core.APP_NAME, '无法创建批量日志：'+str(exc))
-                return
+                return False
             options['batch_log'] = str(batch_log)
         profile = tuple(options[key] for key in ('mode', 'speed', 'smart_scan', 'use_gpu',
-                                                'full_check', 'replace_source', 'fast_replace'))
+                                                'full_check', 'replace_source', 'fast_replace', 'resolution',
+                                                'resource_limits'))
         with job_lock:
             for iid, row in waiting:
+                failures.pop(iid, None)
                 active_run[iid] = (auto_close.get(), None)
-                row.update(profile=profile, prediction=None, remaining=None, eta='分析后显示', time='—')
+                row.update(profile=profile, options=options, prediction=None, remaining=None, eta='分析后显示', time='—')
                 row_update(iid, '排队中')
                 row['result'] = None
                 pending.put((iid, row['source'], generation[0], options))
+        return True
     extensions = {'.mp4', '.mkv', '.mov', '.m4v', '.ts', '.mts', '.m2ts', '.vss', '.ssv', '.tsv', '.css', '.avi', '.webm', '.flv', '.wmv'}
-    def add_files(paths):
+    def add_files(paths, start=True):
         expanded = []
         for item in paths:
             path = Path(item)
@@ -469,6 +526,7 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
                 expanded.append(path)
         active_sources = {row['source'].casefold() for row in rows.values()
                           if row['status'] in ('等待开始', '排队中', '处理中')}
+        added = []
         for path in expanded:
             try:
                 path = path.resolve()
@@ -478,11 +536,13 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
                 rows[iid] = {'source': str(path), 'size': path.stat().st_size, 'status': '等待开始', 'time': '—', 'result': None}
                 tree.insert('', 'end', iid=iid)
                 row_update(iid)
+                added.append(iid)
                 active_sources.add(str(path).casefold())
             except OSError as exc:
                 log_ui('无法添加 '+str(path)+'：'+str(exc))
-        if autostart.get():
+        if start and autostart.get():
             submit()
+        return added
     def select_files(event=None):
         add_files(filedialog.askopenfilenames(title='选择下载文件（无需先改后缀）',
                   filetypes=[('所有文件', '*.*'), ('视频文件', '*.mp4 *.mkv *.ts *.css *.ssv *.mov')]))
@@ -510,30 +570,89 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
             os.startfile(str(core.LOG_DIR))
         except OSError as exc:
             state.set('无法打开日志目录：'+str(exc))
-    def inspect_file():
-        row = selected_row()
-        if not row:
-            state.set('请先选择一个任务，再查看视频信息')
-            return
+    def inspect_file(source, purpose='info'):
         if inspection_running.is_set():
+            state.set('正在读取视频信息，请稍候')
             return
         inspection_running.set()
         inspector.cancelled.clear()
+        inspector.resource_limits = limits
         def job():
             try:
-                data = inspector.probe(row['source'])
-                events.put(('info', row['source'], data))
+                data = inspector.probe(source)
+                events.put((purpose, source, data))
             except Exception as exc:
-                events.put(('info_error', '', str(exc)))
+                events.put(('info_error', purpose, str(exc)))
             finally:
                 inspection_running.clear()
         threading.Thread(target=job, daemon=True).start()
         state.set('正在读取视频信息…')
+
+    def inspect_selected():
+        row = selected_row()
+        if row:
+            inspect_file(row['source'])
+        else:
+            state.set('请先选择一个任务，再查看视频信息')
+
+    def reduce_resolution():
+        row = selected_row()
+        source = row['source'] if row else None
+        if source and not Path(source).is_file():
+            source = (row.get('result') or {}).get('output')
+        if not source:
+            source = filedialog.askopenfilename(title='选择要降低分辨率的视频', parent=root)
+        if source:
+            inspect_file(str(Path(source).resolve()), 'resolution')
+
+    def show_resolution(source, info):
+        video = core.main_video(info)
+        width, height = core.video_dimensions(video) if video else (0, 0)
+        choices = {label: edge for label, edge in core.RESOLUTIONS.items() if edge < min(width, height)}
+        if not choices:
+            messagebox.showinfo('降分辨率', '此视频没有可用的降分辨率档位。', parent=root)
+            return
+        dialog = tk.Toplevel(root)
+        dialog.title('降分辨率')
+        dialog.transient(root)
+        dialog.resizable(False, False)
+        body = ttk.Frame(dialog, padding=18)
+        body.pack(fill='both', expand=True)
+        ttk.Label(body, text=f'{Path(source).name}\n源分辨率 {width} × {height}', wraplength=450).pack(anchor='w')
+        target = tk.StringVar(value=next(reversed(choices)))
+        box = ttk.Combobox(body, textvariable=target, values=list(choices), state='readonly')
+        box.pack(fill='x', pady=(8, 12))
+        ttk.Label(body, text='转码速度').pack(anchor='w')
+        compression_speed = tk.StringVar(value='速度优先')
+        ttk.Combobox(body, textvariable=compression_speed, values=list(SPEEDS), state='readonly').pack(fill='x', pady=(4, 12))
+        ttk.Label(body, text='输出将重新编码并另存为 MP4，保留原文件。', wraplength=450).pack(anchor='w')
+        buttons = ttk.Frame(body)
+        buttons.pack(fill='x', pady=(12, 0))
+
+        def compress():
+            waiting = [iid for iid, row in rows.items() if row['source'].casefold() == source.casefold()
+                       and row['status'] == '等待开始']
+            iids = waiting or add_files([source], start=False)
+            if not iids:
+                messagebox.showinfo('降分辨率', '此文件正在处理，请在当前任务结束后再试。', parent=dialog)
+                return
+            if submit(iids, {'resolution': choices[target.get()], 'mode': 'encode', 'smart_scan': False,
+                             'speed': SPEEDS[compression_speed.get()],
+                             'replace_source': False, 'original_name': False,
+                             'destination': destination_var.get() or None}):
+                dialog.destroy()
+
+        ttk.Button(buttons, text='另存并开始', command=compress, bootstyle='primary').pack(side='right')
+        ttk.Button(buttons, text='取消', command=dialog.destroy).pack(side='right', padx=8)
+        box.focus_set()
+        dialog.grab_set()
+
     def clear_completed():
         for iid in list(rows):
             if rows[iid]['status'] not in ('排队中', '处理中'):
                 tree.delete(iid)
                 del rows[iid]
+                failures.pop(iid, None)
     def retry_rows(candidates, statuses):
         active = {row['source'].casefold() for row in rows.values()
                   if row['status'] in ('等待开始', '排队中', '处理中')}
@@ -544,13 +663,99 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
             if row['status'] in statuses and source not in active:
                 retry_ids.add(iid)
                 active.add(source)
-        if retry_ids:
-            submit(retry_ids)
-        else:
+        if not retry_ids:
             state.set('没有可重试的任务')
+            return
+        normal_ids = []
+        for iid in retry_ids:
+            options = rows[iid]['options']
+            if options['resolution'] is None:
+                normal_ids.append(iid)
+            else:
+                submit([iid], {**options, 'destination': destination_var.get() or options['destination']})
+        submit(normal_ids)
 
     def retry_failed():
         retry_rows(rows, ('失败',))
+
+    def show_failures():
+        nonlocal failure_window
+        if failure_window is not None or not failures or root.grab_current() is not None:
+            return
+        items = list(failures)
+        failures.clear()
+        dialog = failure_window = tk.Toplevel(root)
+        dialog.title('修复建议')
+        dialog.transient(root)
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill='both', expand=True)
+        count = tk.StringVar(value=f'{len(items)} 个文件需要处理')
+        ttk.Label(body, textvariable=count).pack(anchor='w')
+        listing = ttk.Treeview(body, show='tree', selectmode='browse', height=min(len(items), 5))
+        listing.column('#0', width=500)
+        listing.pack(fill='x', pady=(8, 10))
+        for iid in items:
+            listing.insert('', 'end', iid=iid, text=Path(rows[iid]['source']).name)
+        detail = tk.StringVar()
+        ttk.Label(body, textvariable=detail, wraplength=500, justify='left').pack(anchor='w', fill='x')
+        buttons = ttk.Frame(body)
+        buttons.pack(fill='x', pady=(12, 0))
+
+        def close_dialog():
+            nonlocal failure_window
+            failure_window = None
+            dialog.destroy()
+
+        def selection_changed(event=None):
+            if not listing.selection():
+                return
+            result = rows[listing.selection()[0]]['result']
+            detail.set(result['error']+'\n\n'+result['suggestion'])
+            action = result['retry']
+            apply_retry.configure(text='选目录并重试' if action == 'destination' else '按建议重试',
+                                  state='normal' if action else 'disabled')
+
+        def retry():
+            iid = listing.selection()[0]
+            row = rows[iid]
+            action = row['result']['retry']
+            options = dict(row['result']['options'])
+            if action == 'destination':
+                folder = filedialog.askdirectory(title='选择可用的输出目录', parent=dialog)
+                if not folder:
+                    return
+                options.update(destination=folder, replace_source=False)
+            else:
+                options['mode'] = action
+            options['batch_log'] = None
+            if submit([iid], options):
+                listing.delete(iid)
+                remaining = listing.get_children()
+                if remaining:
+                    count.set(f'{len(remaining)} 个文件需要处理')
+                    listing.selection_set(remaining[0])
+                    selection_changed()
+                else:
+                    close_dialog()
+
+        def open_failure_log():
+            result = rows[listing.selection()[0]]['result']
+            if result['log'] and Path(result['log']).is_file():
+                os.startfile(result['log'])
+            else:
+                open_log_directory()
+
+        apply_retry = ttk.Button(buttons, text='按建议重试', command=retry, bootstyle='primary')
+        apply_retry.pack(side='right')
+        ttk.Button(buttons, text='关闭', command=close_dialog).pack(side='right', padx=8)
+        ttk.Button(buttons, text='查看日志', command=open_failure_log).pack(side='left')
+        listing.bind('<<TreeviewSelect>>', selection_changed)
+        listing.selection_set(items[0])
+        selection_changed()
+        dialog.protocol('WM_DELETE_WINDOW', close_dialog)
+        dialog.bind('<Escape>', lambda event: close_dialog())
+        dialog.grab_set()
+        listing.focus_set()
 
     def update_batch_estimate():
         waiting = [row for row in rows.values() if row['status'] == '排队中']
@@ -605,7 +810,14 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
                 events.put(('cancelled', iid, '已取消，原文件保留'))
             except Exception as exc:
                 engine.log('失败：'+path+' · '+str(exc))
-                events.put(('error', iid, {'error': str(exc), 'log': str(engine.log_path) if engine.log_path else None}))
+                retry = getattr(exc, 'retry', None)
+                suggestion = getattr(exc, 'suggestion', None)
+                if isinstance(exc, OSError) and getattr(exc, 'winerror', None) in (5, 32, 112):
+                    retry = 'destination'
+                    suggestion = '检查源文件是否被占用，或选择另一个可写的输出目录重试。'
+                events.put(('error', iid, {'error': str(exc), 'log': str(engine.log_path) if engine.log_path else None,
+                                           'retry': retry, 'options': opts,
+                                           'suggestion': suggestion or '查看日志确认原因；文件下载不完整时，请重新下载后用“自动修复”。'}))
             finally:
                 pending.task_done()
                 busy.clear()
@@ -640,7 +852,9 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
                         log_ui('已跳过：'+value['source'])
                         continue
                     row['eta'] = '已完成'
-                    row_update(iid, '完成 · '+('视频无损' if not value['reencoded_video'] else 'H.264 转换'), value['elapsed_seconds'])
+                    label = next((name for name, edge in core.RESOLUTIONS.items() if edge == value.get('resolution')), None)
+                    method = '降至 '+label if label else 'H.264 转换' if value['reencoded_video'] else '视频无损'
+                    row_update(iid, '完成 · '+method, value['elapsed_seconds'])
                     last_output[0] = value['output']
                     mode = '完整检查' if value['validation_mode'] == 'full' else '快速检查'
                     state.set('完成 · '+core.Engine._clock(value['elapsed_seconds'])+' · '+mode+' · '+size_text(value['bytes']))
@@ -657,7 +871,8 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
                     row_update(iid, '失败' if kind == 'error' else '已取消')
                     message = value['error'] if kind == 'error' else value
                     if kind == 'error':
-                        rows[iid]['result'] = {'log': value['log']}
+                        rows[iid]['result'] = value
+                        failures[iid] = None
                     state.set(message)
                     estimate_var.set('任务已停止，原文件保留')
                     log_ui(message)
@@ -669,6 +884,11 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
                 elif kind == 'info_error':
                     state.set(value)
                     log_ui(value)
+                    if iid == 'resolution':
+                        messagebox.showerror('降分辨率', value, parent=root)
+                elif kind == 'resolution':
+                    state.set('已读取源视频分辨率')
+                    show_resolution(iid, value)
                 elif kind == 'hardware':
                     hardware_data[0] = value
                     hardware_var.set('CPU：'+value['cpu']+'（'+str(value['logical_cores'])+' 线程） · GPU：'+('、'.join(value['gpus']) or '未识别到型号，转码时仍会实测'))
@@ -704,6 +924,8 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
         summary.set(f'{len(rows)} 个任务 · 修复 {completed} · 跳过 {skipped} · 失败 {failed} · 等待 {sum(r["status"] in ("等待开始", "排队中") for r in rows.values())}')
         if not busy.is_set() and pending.empty():
             show_mode()
+            if not smoke_seconds:
+                show_failures()
             if active_run and all(done is not None for _, done in active_run.values()):
                 close_when_done = all(requested and done for requested, done in active_run.values())
                 active_run.clear()
@@ -717,7 +939,8 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
                              ('开始任务', submit, 'primary'), ('停止', stop, 'danger-outline'),
                              ('重试失败', retry_failed, 'warning-outline')]:
         ttk.Button(actions, text=text, command=action, bootstyle=bs, padding=(7, 6)).pack(side='left', padx=(0, 6))
-    for text, action in [('视频信息', inspect_file), ('打开目录', open_output), ('日志目录', open_log_directory),
+    for text, action in [('视频信息', inspect_selected), ('降分辨率', reduce_resolution),
+                         ('打开目录', open_output), ('日志目录', open_log_directory),
                          ('重试选中', lambda: retry_rows(tree.selection(), ('失败', '已取消'))), ('清空记录', clear_completed)]:
         ttk.Button(secondary_actions, text=text, command=action, bootstyle='info-outline',
                    padding=(7, 5)).pack(side='left', padx=(0, 6))
@@ -748,7 +971,8 @@ def run_gui(core, initial_files, smoke_seconds=None, result_file=None, smoke_can
                        'smart_scan': smart_scan.get(), 'replace_source': replace_source.get(),
                        'fast_replace': fast_replace.get(),
                        'original_name': original_name.get(),
-                       'use_gpu': use_gpu.get(), 'auto_close': auto_close.get(), 'full_check_enabled': CHECKS[check_var.get()]}
+                       'use_gpu': use_gpu.get(), 'auto_close': auto_close.get(), 'full_check_enabled': CHECKS[check_var.get()],
+                       'resource_limits': limits._asdict()}
             temp = path.with_suffix('.tmp')
             temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
             temp.replace(path)
